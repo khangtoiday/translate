@@ -1,0 +1,354 @@
+// ==UserScript==
+// @name         Auto Translate On Selection (VI ⇄ EN)
+// @namespace    http://tampermonkey.net/
+// @version      3.1
+// @description  Bôi đen văn bản để tự động dịch hai chiều Anh ⇄ Việt, chỉ 1 request mỗi lần
+// @author       You
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @connect      translate.googleapis.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const BOX_ID = 'auto-tr-popup-box';
+  const MAX_TEXT_LENGTH = 4500; // giới hạn an toàn cho query string của endpoint
+  let debounceTimer = null;
+
+  // Theo dõi request đang chạy để tránh race condition (kết quả cũ ghi đè kết quả mới)
+  let currentRequestId = 0;
+
+  // Cache nhỏ trong bộ nhớ: cùng 1 đoạn text + chiều dịch thì trả kết quả ngay,
+  // không cần gọi lại request (tăng tốc khi bôi lại đoạn cũ). Giới hạn kích thước
+  // để tránh phình bộ nhớ trên các trang mở lâu.
+  const translationCache = new Map();
+  const CACHE_MAX_SIZE = 200;
+
+  function cacheGet(key) {
+    return translationCache.has(key) ? translationCache.get(key) : null;
+  }
+
+  function cacheSet(key, value) {
+    if (translationCache.size >= CACHE_MAX_SIZE) {
+      const oldestKey = translationCache.keys().next().value;
+      translationCache.delete(oldestKey);
+    }
+    translationCache.set(key, value);
+  }
+
+  // ---------- Style (áp trực tiếp qua element.style thay vì thẻ <style>) ----------
+  // Lý do: một số trang (như PDF.js viewer) có CSP style-src chặn thẻ <style> chèn
+  // từ userscript, khiến toàn bộ CSS không được áp dụng dù element vẫn có trong DOM.
+  // Gán qua .style.xxx bằng JS không đi qua CSP style-src nên luôn hoạt động.
+  function applyStyles(el, styles) {
+    for (const prop in styles) {
+      el.style[prop] = styles[prop];
+    }
+  }
+
+  const BOX_BASE_STYLE = {
+    position: 'fixed',
+    zIndex: '2147483647',
+    maxWidth: '340px',
+    background: '#1e1e1e',
+    color: '#f2f2f2',
+    fontSize: '14px',
+    lineHeight: '1.5',
+    padding: '10px 12px',
+    borderRadius: '8px',
+    boxShadow: '0 6px 20px rgba(0,0,0,0.35)',
+    fontFamily: '-apple-system, "Segoe UI", Roboto, Arial, sans-serif',
+    border: '1px solid #3a3a3a',
+    pointerEvents: 'auto',
+    opacity: '0',
+    transform: 'translateY(4px)',
+    transition: 'opacity .12s ease, transform .12s ease',
+    boxSizing: 'border-box',
+  };
+
+  const ORIGINAL_STYLE = {
+    color: '#9aa0a6',
+    fontSize: '12px',
+    marginBottom: '4px',
+    borderBottom: '1px solid #3a3a3a',
+    paddingBottom: '4px',
+    maxHeight: '60px',
+    overflow: 'hidden',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+  };
+
+  const BODY_STYLE = {
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+  };
+
+  const CLOSE_STYLE = {
+    position: 'absolute',
+    top: '4px',
+    right: '6px',
+    cursor: 'pointer',
+    color: '#888',
+    fontSize: '13px',
+    lineHeight: '1',
+    userSelect: 'none',
+  };
+
+  const LOADING_STYLE = {
+    color: '#9aa0a6',
+    fontStyle: 'italic',
+  };
+
+  const ERROR_STYLE = {
+    color: '#ff8a80',
+  };
+
+  // ---------- Detect ngôn ngữ local (không tốn request) ----------
+  // Nguyên tắc: tiếng Việt có dấu gần như không xuất hiện trong tiếng Anh.
+  // Có dấu -> chắc chắn 'vi'. Không có dấu -> mặc định 'en' (fallback đơn giản).
+  const VI_DIACRITICS_RE =
+    /[àáạảãăằắặẳẵâầấậẩẫđèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹ]/i;
+
+  function detectLangSimple(text) {
+    return VI_DIACRITICS_RE.test(text) ? 'vi' : 'en';
+  }
+
+  // Trả về {sl, tl} dựa trên detect local
+  function getEffectiveDirection(text) {
+    const detected = detectLangSimple(text);
+    return detected === 'vi' ? { sl: 'vi', tl: 'en' } : { sl: 'en', tl: 'vi' };
+  }
+
+  // ---------- Popup helpers ----------
+  function removeBox() {
+    const el = document.getElementById(BOX_ID);
+    if (el) el.remove();
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  function truncate(str, n) {
+    return str.length > n ? str.slice(0, n) + '…' : str;
+  }
+
+  function createBoxSkeleton(x, y, originalText) {
+    removeBox();
+
+    const box = document.createElement('div');
+    box.id = BOX_ID;
+    applyStyles(box, BOX_BASE_STYLE);
+    box.style.left = `${x}px`;
+    box.style.top = `${y}px`;
+
+    const closeBtn = document.createElement('span');
+    closeBtn.textContent = '✕';
+    applyStyles(closeBtn, CLOSE_STYLE);
+    closeBtn.addEventListener('click', removeBox);
+    closeBtn.addEventListener('mouseenter', () => { closeBtn.style.color = '#fff'; });
+    closeBtn.addEventListener('mouseleave', () => { closeBtn.style.color = '#888'; });
+
+    const originalDiv = document.createElement('div');
+    originalDiv.className = 'tr-original';
+    applyStyles(originalDiv, ORIGINAL_STYLE);
+    originalDiv.textContent = truncate(originalText, 120);
+
+    const bodyDiv = document.createElement('div');
+    bodyDiv.className = 'tr-body';
+    applyStyles(bodyDiv, BODY_STYLE);
+
+    const loadingDiv = document.createElement('div');
+    applyStyles(loadingDiv, LOADING_STYLE);
+    loadingDiv.textContent = 'Đang dịch...';
+    bodyDiv.appendChild(loadingDiv);
+
+    box.appendChild(closeBtn);
+    box.appendChild(originalDiv);
+    box.appendChild(bodyDiv);
+
+    document.body.appendChild(box);
+
+    requestAnimationFrame(() => {
+      box.style.opacity = '1';
+      box.style.transform = 'translateY(0)';
+    });
+
+    // Không để mousedown trong popup làm mất selection / đóng popup
+    box.addEventListener('mousedown', (e) => e.stopPropagation());
+
+    return box;
+  }
+
+  function setBoxResult(box, translated) {
+    const bodyDiv = box.querySelector('.tr-body');
+    bodyDiv.innerHTML = '';
+    const resultDiv = document.createElement('div');
+    resultDiv.textContent = translated;
+    bodyDiv.appendChild(resultDiv);
+  }
+
+  function setBoxError(box, message) {
+    const bodyDiv = box.querySelector('.tr-body');
+    bodyDiv.innerHTML = '';
+    const errDiv = document.createElement('div');
+    applyStyles(errDiv, ERROR_STYLE);
+    errDiv.textContent = message;
+    bodyDiv.appendChild(errDiv);
+  }
+
+  // ---------- Gọi Google Translate ----------
+  const REQUEST_TIMEOUT_MS = 8000;
+
+  function parseTranslateResponse(text) {
+    const data = JSON.parse(text);
+    if (!data || !Array.isArray(data[0])) {
+      throw new Error('Response không hợp lệ');
+    }
+    const translated = data[0].map((chunk) => chunk[0]).join('');
+    if (!translated) {
+      throw new Error('Không có bản dịch');
+    }
+    return translated;
+  }
+
+  // Dùng GM_xmlhttpRequest làm phương án dự phòng nếu fetch() thất bại
+  // (ví dụ do CSP connect-src của trang chặn fetch tới domain ngoài).
+  function translateViaGM(url, callback) {
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url,
+      timeout: REQUEST_TIMEOUT_MS,
+      onload: function (res) {
+        try {
+          if (res.status < 200 || res.status >= 300) {
+            callback(new Error('HTTP ' + res.status));
+            return;
+          }
+          callback(null, parseTranslateResponse(res.responseText));
+        } catch (e) {
+          callback(e);
+        }
+      },
+      onerror: function () {
+        callback(new Error('Lỗi mạng'));
+      },
+      ontimeout: function () {
+        callback(new Error('Request timeout'));
+      },
+    });
+  }
+
+  // Ưu tiên fetch() thẳng trong trang: nhanh hơn GM_xmlhttpRequest vì không phải
+  // chuyển tiếp qua background/service worker của extension. Endpoint này cho phép
+  // gọi cross-origin trực tiếp. Nếu fetch lỗi (bị chặn bởi CSP connect-src của
+  // trang, hoặc lỗi mạng khác), tự động rơi về GM_xmlhttpRequest.
+  function translateText(text, sl, tl, callback) {
+    const url =
+      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=` +
+      encodeURIComponent(text);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    fetch(url, { method: 'GET', signal: controller.signal })
+      .then((res) => {
+        clearTimeout(timer);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.text();
+      })
+      .then((text) => callback(null, parseTranslateResponse(text)))
+      .catch(() => {
+        clearTimeout(timer);
+        // fetch thất bại (thường do CSP connect-src) -> thử lại bằng GM_xmlhttpRequest
+        translateViaGM(url, callback);
+      });
+  }
+
+  // ---------- Luồng dịch chính ----------
+  function runTranslateFlow(text, x, y) {
+    let truncated = false;
+    let payload = text;
+    if (payload.length > MAX_TEXT_LENGTH) {
+      payload = payload.slice(0, MAX_TEXT_LENGTH);
+      truncated = true;
+    }
+
+    const reqId = ++currentRequestId;
+    const { sl, tl } = getEffectiveDirection(payload);
+    const cacheKey = `${sl}|${tl}|${payload}`;
+
+    const box = createBoxSkeleton(x, y, text);
+
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      // Có sẵn trong cache -> hiện ngay, không cần chờ mạng
+      setBoxResult(box, truncated ? cached + ' …' : cached);
+      return;
+    }
+
+    translateText(payload, sl, tl, (err, translated) => {
+      // Bỏ qua nếu đã có request mới hơn xuất hiện, hoặc popup đã bị đóng
+      if (reqId !== currentRequestId) return;
+      const current = document.getElementById(BOX_ID);
+      if (!current) return;
+
+      if (err) {
+        setBoxError(current, 'Lỗi khi dịch. Thử lại.');
+        return;
+      }
+      cacheSet(cacheKey, translated);
+      setBoxResult(current, truncated ? translated + ' …' : translated);
+    });
+  }
+
+  // ---------- Position helper ----------
+  function getSelectionPosition() {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+
+    return {
+      x: rect.left,
+      y: rect.bottom + 8,
+    };
+  }
+
+  // ---------- Main handler ----------
+  document.addEventListener('mouseup', (e) => {
+    // Bỏ qua nếu đang thao tác trong chính popup
+    if (e.target.closest && e.target.closest(`#${BOX_ID}`)) return;
+
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const sel = window.getSelection();
+      const text = sel.toString().trim();
+
+      if (!text || text.length < 1) {
+        removeBox();
+        return;
+      }
+
+      const pos = getSelectionPosition();
+      if (!pos) return;
+
+      runTranslateFlow(text, pos.x, pos.y);
+    }, 80); // debounce nhẹ để tránh gọi API liên tục khi kéo chọn
+  });
+
+  // Đóng popup khi click ra ngoài
+  document.addEventListener('mousedown', (e) => {
+    if (e.target.closest && e.target.closest(`#${BOX_ID}`)) return;
+    removeBox();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') removeBox();
+  });
+})();
